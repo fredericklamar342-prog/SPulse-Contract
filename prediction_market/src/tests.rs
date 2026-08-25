@@ -1654,6 +1654,75 @@ fn test_withdraw_fees_zero() {
     t.client.withdraw_fees(&t.admin, &t.admin);
 }
 
+// ── Issue #94: withdraw_fees cannot take empty-side principal ─────────────────
+
+#[test]
+fn test_withdraw_fees_cannot_take_empty_side_principal() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+
+    // Only YES bets — no one bets NO
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+
+    // Advance past end_time and resolve NO (empty winning side)
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &false);
+
+    let treasury = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &treasury);
+    // Fees locked in ForfeitedPool — nothing withdrawable yet.
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+    assert!(t.client.try_withdraw_fees(&t.admin, &treasury).is_err());
+
+    advance_time(&t.env, DISPUTE_WINDOW_SECS);
+    t.client.finalize_zero_side(&id);
+    let withdrawn = withdraw_all_admin_fees(&t, &treasury);
+    assert_eq!(withdrawn, 1_5000000);
+
+    let alice_before = t.xlm.balance(&alice);
+    t.client.claim(&alice, &id);
+    assert_eq!(t.xlm.balance(&alice), alice_before + 98_0000000);
+}
+
+#[test]
+fn test_finalize_zero_side_rejects_before_dispute_window() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &false);
+
+    // Too soon — dispute window not elapsed
+    assert!(t.client.try_finalize_zero_side(&id).is_err());
+
+    advance_time(&t.env, DISPUTE_WINDOW_SECS);
+    t.client.finalize_zero_side(&id);
+    // Should succeed now
+    assert!(t.client.get_accumulated_fees() > 0);
+}
+
+#[test]
+fn test_get_forfeited_pool_tracks_zero_side() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &false);
+
+    let fp = t.client.get_forfeited_pool(&id).expect("forfeited pool");
+    assert_eq!(fp.amount, 98_0000000);
+    assert_eq!(fp.locked_fees, 1_5000000);
+    assert!(!fp.frozen);
+}
+
 // ── 36. Claim with no bet → NoBetFound ───────────────────────────────────────
 
 #[test]

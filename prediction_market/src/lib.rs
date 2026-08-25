@@ -63,6 +63,10 @@ const MAX_GOVERNORS: u32 = 10;
 // ConfigChangeStaged event) and the admin can cancel it before it lands.
 const CONFIG_CHANGE_DELAY_SECS: u64 = 86_400; // 24h timelock
 
+// Issue #94: 7-day dispute window before swept-pool principal is released
+// to fee recipients. Gives off-chain monitors time to detect griefing.
+const DISPUTE_WINDOW_SECS: u64 = 604_800; // 7 days
+
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
@@ -156,6 +160,10 @@ pub enum DataKey {
     // ── Fee provenance (issue #4): per-market sub-ledger ──────────────────
     FeeLedger(u64), // i128 — fees of market m still backing refunds (not yet earned)
     OpenFees,       // i128 — Σ FeeLedger over open (unsettled) markets
+    // Issue #94: per-market vault for empty-side principal + locked fees.
+    // Principal is paid via Payout; locked_fees rejoin MarketFees only after
+    // the dispute window (or stay out forever if the market is frozen/cancelled).
+    ForfeitedPool(u64),
     // ── Timelocked withdrawal requests (issue #12) ───────────────────────
     PendingWithdrawal(Address), // caller -> WithdrawalRequest
     // ── Dependency governance (issue #51) ────────────────────────────────
@@ -231,6 +239,18 @@ pub struct WithdrawalRequest {
     pub recipient: Address,
     pub amount: i128, 
     pub requested_at: u64,
+}
+
+/// Per-market vault for empty-side principal + locked fees (issue #94).
+/// Principal is paid via Payout; locked_fees rejoin MarketFees only after the
+/// dispute window (or stay out forever if the market is frozen/cancelled).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForfeitedPool {
+    pub amount: i128,
+    pub locked_fees: i128,
+    pub resolved_at: u64,
+    pub frozen: bool,
 }
 
 // ── Domain Structs ────────────────────────────────────────────────────────────
@@ -1177,11 +1197,35 @@ impl PredictionMarketContract {
             .unwrap_or(0);
 
         if winning_side == 0 {
-            // No contest on the winning side — the whole pool is swept to
-            // accumulated fees (protocol-defined behavior, kept from prior
-            // design). Bettors still earn tokens/points via claim().
+            // No contest on the winning side — the whole pool is user
+            // principal (bets from the losing side). Route it to
+            // ForfeitedPool so it is excluded from fee withdrawals
+            // (issue #94). Bettors still earn tokens/points via claim().
+            // Platform fees (MarketFees) are locked out of AccumulatedFees
+            // until finalize_zero_side releases them after the dispute window.
             if total_pool > 0 {
-                acc_fees += total_pool;
+                let market_fee_key = DataKey::MarketFees(market_id);
+                let locked_fees: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&market_fee_key)
+                    .unwrap_or(0);
+                let fp_key = DataKey::ForfeitedPool(market_id);
+                env.storage().persistent().set(
+                    &fp_key,
+                    &ForfeitedPool {
+                        amount: total_pool,
+                        locked_fees,
+                        resolved_at: env.ledger().timestamp(),
+                        frozen: false,
+                    },
+                );
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&fp_key, TTL_BUMP, TTL_HIGH);
+                // Drain the market's fee ledger from AccumulatedFees —
+                // these fees are locked in ForfeitedPool until finalized.
+                acc_fees = acc_fees.saturating_sub(locked_fees);
             }
         } else {
             // Settlement-time payouts (issue #2): compute EXACT per-winner
@@ -1736,6 +1780,57 @@ impl PredictionMarketContract {
             caller,
         );
         Ok(())
+    }
+
+    // ── Forfeited Pool (issue #94) ───────────────────────────────────────
+
+    /// Finalize a zero-side resolution after the dispute window. Releases
+    /// the locked platform fees to AccumulatedFees so admin can withdraw
+    /// them via the normal capped path. The principal stays in the pool
+    /// for claimers.
+    pub fn finalize_zero_side(
+        env: Env,
+        market_id: u64,
+    ) -> Result<(), MarketError> {
+        let fp_key = DataKey::ForfeitedPool(market_id);
+        let mut pool: ForfeitedPool = env
+            .storage()
+            .persistent()
+            .get(&fp_key)
+            .ok_or(MarketError::MarketNotFound)?;
+        if pool.frozen {
+            return Err(MarketError::MarketCancelled);
+        }
+        let now = env.ledger().timestamp();
+        if now < pool.resolved_at
+            || now - pool.resolved_at < DISPUTE_WINDOW_SECS
+        {
+            return Err(MarketError::WithdrawalTooSoon);
+        }
+        if pool.locked_fees > 0 {
+            let mut acc: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AccumulatedFees)
+                .unwrap_or(0);
+            acc += pool.locked_fees;
+            env.storage()
+                .instance()
+                .set(&DataKey::AccumulatedFees, &acc);
+            pool.locked_fees = 0;
+            env.storage().persistent().set(&fp_key, &pool);
+        }
+        Ok(())
+    }
+
+    /// Read the forfeited pool for a market (view).
+    pub fn get_forfeited_pool(
+        env: Env,
+        market_id: u64,
+    ) -> Option<ForfeitedPool> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ForfeitedPool(market_id))
     }
 
     // ── View Functions ────────────────────────────────────────────────────
